@@ -19,7 +19,10 @@ class FrigateNativeCard extends LitElement {
       _showCameraMenu: { state: true },
       _showLabelMenu: { state: true },
       _activeLabels: { state: true },
-      _loadedClipsPerCamera: { state: true }
+      _loadedClipsPerCamera: { state: true },
+      _dateFilter: { state: true },
+      _showDateMenu: { state: true },
+      _currentColumns: { state: true }
     };
   }
 
@@ -31,12 +34,19 @@ class FrigateNativeCard extends LitElement {
     this._cameraToggleTimeout = null;
     this._visibleClips = new Set();
     this._allClips = [];
-    this._fetchAbortController = null;
     this._thumbnailLoadQueue = new Set();
     this._showCameraMenu = false;
     this._showLabelMenu = false;
+    this._showDateMenu = false;
     this._activeLabels = new Set();
     this._loadedClipsPerCamera = {};
+    this._dateFilter = 'all';
+    this._currentColumns = 3;
+    this._mediaRequestToken = 0;
+    this._clipRequestToken = 0;
+    this._scrollLoadHandler = null;
+    this._scrollLoadFrame = null;
+    this._observedScroller = null;
   }
 
   setConfig(config) {
@@ -44,8 +54,6 @@ class FrigateNativeCard extends LitElement {
       throw new Error('Please define "entities" (list of cameras)');
     }
     this.config = {
-      limit: 50,
-      columns: 3,
       title: 'Security Feed',
       virtualScrolling: true,
       card_height: '',
@@ -90,12 +98,8 @@ class FrigateNativeCard extends LitElement {
     return Array.from(labels).sort();
   }
 
-  async fetchMedia(isRefresh = false) {
-    if (this._fetchAbortController) {
-      this._fetchAbortController.abort();
-    }
-    this._fetchAbortController = new AbortController();
-
+  async fetchMedia() {
+    const requestToken = ++this._mediaRequestToken;
     this._loading = true;
     this._error = null;
 
@@ -104,10 +108,12 @@ class FrigateNativeCard extends LitElement {
       let allClips = [];
 
       const root = await this.hass.callWS({ type: 'media_source/browse_media', media_content_id: 'media-source://frigate' });
+      if (requestToken !== this._mediaRequestToken) return;
       if (!root.children || root.children.length === 0) throw new Error("Frigate Media Source empty.");
       const instance = root.children[0];
 
       const instanceRoot = await this.hass.callWS({ type: 'media_source/browse_media', media_content_id: instance.media_content_id });
+      if (requestToken !== this._mediaRequestToken) return;
 
       let eventsFolder = instanceRoot.children?.find(c => {
         const t = c.title.toLowerCase();
@@ -118,6 +124,7 @@ class FrigateNativeCard extends LitElement {
 
       if (eventsFolder) {
         const eventsContent = await this.hass.callWS({ type: 'media_source/browse_media', media_content_id: eventsFolder.media_content_id });
+        if (requestToken !== this._mediaRequestToken) return;
         potentialCameraFolders = eventsContent.children || [];
       }
 
@@ -127,11 +134,13 @@ class FrigateNativeCard extends LitElement {
           const cameraClips = [];
           const limit = this._loadedClipsPerCamera[cleanTitle] || this.config.clipsPerLoad;
           await this.fetchClipsFromCameraFolder(folder, cameraClips, limit);
+          if (requestToken !== this._mediaRequestToken) return;
           cameraClips.forEach(c => c._camera = cleanTitle);
           allClips = allClips.concat(cameraClips);
         }
       }
 
+      if (requestToken !== this._mediaRequestToken) return;
       this.cleanupUnusedThumbnails(allClips);
       this._allClips = allClips;
 
@@ -148,13 +157,14 @@ class FrigateNativeCard extends LitElement {
       }
 
     } catch (e) {
-      if (e.name !== 'AbortError') {
+      if (requestToken === this._mediaRequestToken && e.name !== 'AbortError') {
         console.error('[FrigateCard] Media fetch error:', e);
         this._error = e.message;
       }
     } finally {
-      this._loading = false;
-      this._fetchAbortController = null;
+      if (requestToken === this._mediaRequestToken) {
+        this._loading = false;
+      }
     }
   }
 
@@ -190,6 +200,23 @@ class FrigateNativeCard extends LitElement {
           title.includes(label.toLowerCase())
         );
         if (!hasActiveLabel) return false;
+      }
+      
+      // Date filtering
+      if (this._dateFilter !== 'all') {
+        const dateRegex = /(\d{4}-\d{2}-\d{2}[\s_T]\d{2}:\d{2}:\d{2})/;
+        const match = clip.title.match(dateRegex);
+        if (match) {
+          const clipDate = new Date(match[1].replace(/[_T]/, ' '));
+          const now = new Date();
+          const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          const clipDay = new Date(clipDate.getFullYear(), clipDate.getMonth(), clipDate.getDate());
+          const diffDays = Math.round((today - clipDay) / (1000 * 60 * 60 * 24));
+          
+          if (this._dateFilter === 'today' && diffDays !== 0) return false;
+          if (this._dateFilter === 'yesterday' && diffDays !== 1) return false;
+          if (this._dateFilter === 'past_week' && diffDays > 7) return false;
+        }
       }
 
       return true;
@@ -290,6 +317,68 @@ class FrigateNativeCard extends LitElement {
     if (changedProps.has('_clips') && this.config.virtualScrolling) {
       this.setupIntersectionObserver();
     }
+    this.setupScrollLazyLoader();
+    this.setupResizeObserver();
+  }
+
+  setupResizeObserver() {
+    if (!this._resizeObserver) {
+      this._resizeObserver = new ResizeObserver(entries => {
+        for (let entry of entries) {
+          const width = entry.contentRect.width;
+          let cols = 3;
+          if (width < 600) cols = 2;
+          else if (width < 1000) cols = 3;
+          else if (width < 1400) cols = 4;
+          else cols = 5;
+          
+          if (this._currentColumns !== cols) {
+            this._currentColumns = cols;
+          }
+        }
+      });
+      this.updateComplete.then(() => {
+        const container = this.shadowRoot.querySelector('ha-card');
+        if (container) this._resizeObserver.observe(container);
+      });
+    }
+  }
+
+  formatClipTitle(rawTitle) {
+    const dateRegex = /(\d{4}-\d{2}-\d{2}[\s_T]\d{2}:\d{2}:\d{2})/;
+    const match = rawTitle.match(dateRegex);
+    if (!match) return rawTitle;
+
+    try {
+      const dateStr = match[1].replace(/[_T]/, ' ');
+      const clipDate = new Date(dateStr);
+      
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const clipDay = new Date(clipDate.getFullYear(), clipDate.getMonth(), clipDate.getDate());
+      
+      let dayStr = "";
+      if (clipDay.getTime() === today.getTime()) {
+        dayStr = "Today";
+      } else if (clipDay.getTime() === yesterday.getTime()) {
+        dayStr = "Yesterday";
+      } else {
+        dayStr = clipDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      }
+
+      const timeStr = clipDate.toLocaleTimeString(undefined, { 
+        hour: '2-digit', minute: '2-digit', hour12: false 
+      });
+      
+      const labelsRegex = /[-_\[\]]/g;
+      const cleanLabel = rawTitle.replace(dateRegex, '').replace(labelsRegex, ' ').trim().replace(/\s+/g, ' ');
+
+      return `${dayStr} ${timeStr}${cleanLabel ? ' - ' + cleanLabel : ''}`;
+    } catch(e) {
+      return rawTitle;
+    }
   }
 
   scrollPlayerIntoView() {
@@ -306,6 +395,9 @@ class FrigateNativeCard extends LitElement {
       this._intersectionObserver.disconnect();
       this._intersectionObserver = null;
     }
+
+    const scroller = this.shadowRoot?.querySelector('.scroller');
+    const observerRoot = this.config.card_height ? scroller : null;
 
     this._intersectionObserver = new IntersectionObserver(
       (entries) => {
@@ -332,13 +424,78 @@ class FrigateNativeCard extends LitElement {
           this.requestUpdate();
         }
       },
-      { root: null, rootMargin: '200px', threshold: 0.01 }
+      { root: observerRoot, rootMargin: '200px', threshold: 0.01 }
     );
 
     this.updateComplete.then(() => {
       this.shadowRoot.querySelectorAll('.thumbnail').forEach(el => {
         this._intersectionObserver.observe(el);
       });
+      this.loadVisibleThumbnails();
+    });
+  }
+
+  setupScrollLazyLoader() {
+    const scroller = this.shadowRoot?.querySelector('.scroller');
+    if (this._observedScroller === scroller) {
+      return;
+    }
+
+    if (this._observedScroller && this._scrollLoadHandler) {
+      this._observedScroller.removeEventListener('scroll', this._scrollLoadHandler);
+    }
+
+    this._observedScroller = scroller;
+
+    if (!scroller || !this.config.virtualScrolling) {
+      return;
+    }
+
+    this._scrollLoadHandler = () => {
+      if (this._scrollLoadFrame !== null) {
+        return;
+      }
+
+      this._scrollLoadFrame = window.requestAnimationFrame(() => {
+        this._scrollLoadFrame = null;
+        this.loadVisibleThumbnails();
+      });
+    };
+
+    scroller.addEventListener('scroll', this._scrollLoadHandler, { passive: true });
+    this.loadVisibleThumbnails();
+  }
+
+  loadVisibleThumbnails() {
+    if (!this._clips?.length) {
+      return;
+    }
+
+    const scroller = this.shadowRoot?.querySelector('.scroller');
+    const rootRect = this.config.card_height && scroller
+      ? scroller.getBoundingClientRect()
+      : { top: 0, bottom: window.innerHeight };
+    const preloadOffset = 250;
+
+    this.shadowRoot.querySelectorAll('.thumbnail').forEach(el => {
+      const clipId = el.dataset.clipId;
+      if (!clipId || this._thumbnails[clipId] || this._thumbnailLoadQueue.has(clipId)) {
+        return;
+      }
+
+      const rect = el.getBoundingClientRect();
+      const isNearViewport =
+        rect.bottom >= rootRect.top - preloadOffset &&
+        rect.top <= rootRect.bottom + preloadOffset;
+
+      if (!isNearViewport) {
+        return;
+      }
+
+      const clip = this._clips.find(item => item.media_content_id === clipId);
+      if (clip) {
+        this.loadSingleThumbnail(clip);
+      }
     });
   }
 
@@ -399,6 +556,7 @@ class FrigateNativeCard extends LitElement {
       this.closeClip();
       return;
     }
+    const requestToken = ++this._clipRequestToken;
     this._selectedClip = clip;
     this._videoUrl = null;
     this._videoError = null;
@@ -407,13 +565,19 @@ class FrigateNativeCard extends LitElement {
         type: 'media_source/resolve_media',
         media_content_id: clip.media_content_id
       });
+      if (requestToken !== this._clipRequestToken || this._selectedClip?.media_content_id !== clip.media_content_id) {
+        return;
+      }
       this._videoUrl = result.url;
     } catch (e) {
-      this._videoError = `Could not resolve video: ${e.message}`;
+      if (requestToken === this._clipRequestToken) {
+        this._videoError = `Could not resolve video: ${e.message}`;
+      }
     }
   }
 
   closeClip() {
+    this._clipRequestToken += 1;
     const videoEl = this.shadowRoot.querySelector('video');
     if (videoEl) {
       if (this._videoErrorHandler) {
@@ -468,7 +632,7 @@ class FrigateNativeCard extends LitElement {
   }
 
   handleRefresh() {
-    this.fetchMedia(true);
+    this.fetchMedia();
   }
 
   handleLoadMore() {
@@ -481,12 +645,31 @@ class FrigateNativeCard extends LitElement {
 
   toggleCameraMenu() {
     this._showCameraMenu = !this._showCameraMenu;
-    if (this._showCameraMenu) this._showLabelMenu = false;
+    if (this._showCameraMenu) {
+      this._showLabelMenu = false;
+      this._showDateMenu = false;
+    }
   }
 
   toggleLabelMenu() {
     this._showLabelMenu = !this._showLabelMenu;
-    if (this._showLabelMenu) this._showCameraMenu = false;
+    if (this._showLabelMenu) {
+      this._showCameraMenu = false;
+      this._showDateMenu = false;
+    }
+  }
+
+  toggleDateMenu() {
+    this._showDateMenu = !this._showDateMenu;
+    if (this._showDateMenu) {
+      this._showCameraMenu = false;
+      this._showLabelMenu = false;
+    }
+  }
+
+  setDateFilter(filter) {
+    this._dateFilter = filter;
+    this.updateDisplayedClips();
   }
 
   disconnectedCallback() {
@@ -505,14 +688,24 @@ class FrigateNativeCard extends LitElement {
       this._intersectionObserver = null;
     }
 
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
+
     if (this._cameraToggleTimeout) {
       clearTimeout(this._cameraToggleTimeout);
       this._cameraToggleTimeout = null;
     }
 
-    if (this._fetchAbortController) {
-      this._fetchAbortController.abort();
-      this._fetchAbortController = null;
+    if (this._observedScroller && this._scrollLoadHandler) {
+      this._observedScroller.removeEventListener('scroll', this._scrollLoadHandler);
+      this._observedScroller = null;
+    }
+
+    if (this._scrollLoadFrame !== null) {
+      window.cancelAnimationFrame(this._scrollLoadFrame);
+      this._scrollLoadFrame = null;
     }
 
     const videoEl = this.shadowRoot?.querySelector('video');
@@ -526,7 +719,7 @@ class FrigateNativeCard extends LitElement {
 
     const visibleClips = this._clips || [];
     const cams = this.getTargetCameras();
-    const columns = this.config.columns || 3;
+    const columns = this._currentColumns;
     const cardHeight = this.config.card_height;
     const availableLabels = this.extractLabels(this._allClips || []);
 
@@ -579,6 +772,10 @@ class FrigateNativeCard extends LitElement {
                   ${activeCamCount < cams.length ? html`<span class="badge">${activeCamCount}</span>` : ''}
                 </button>
               ` : ''}
+              <button class="icon-btn ${this._showDateMenu ? 'active' : ''}" @click=${this.toggleDateMenu} title="Filter by date">
+                <ha-icon icon="mdi:calendar-range"></ha-icon>
+                ${this._dateFilter !== 'all' ? html`<span class="badge">1</span>` : ''}
+              </button>
               <button class="icon-btn" @click=${this.handleRefresh} title="Refresh clips" ?disabled=${this._loading}>
                 <ha-icon icon="mdi:refresh" class="${this._loading ? 'spinning' : ''}"></ha-icon>
               </button>
@@ -616,6 +813,27 @@ class FrigateNativeCard extends LitElement {
               </div>
             </div>
           ` : ''}
+
+          ${this._showDateMenu ? html`
+            <div class="menu-panel">
+              <div class="menu-title">Date Filter</div>
+              <div class="filters">
+                ${[
+                  {id: 'all', label: 'All Time'}, 
+                  {id: 'today', label: 'Today'}, 
+                  {id: 'yesterday', label: 'Yesterday'}, 
+                  {id: 'past_week', label: 'Past Week'}
+                ].map(filter => html`
+                  <button 
+                    class="chip ${this._dateFilter === filter.id ? 'active' : ''}"
+                    @click=${() => this.setDateFilter(filter.id)}
+                  >
+                    ${filter.label}
+                  </button>
+                `)}
+              </div>
+            </div>
+          ` : ''}
         </div>
 
         <div class="scroller" style="${scrollerStyle}">
@@ -648,9 +866,9 @@ class FrigateNativeCard extends LitElement {
       >
         ${thumbUrl ?
         html`<img src="${thumbUrl}" loading="lazy" alt="${clip.title}" />` :
-        html`<div class="loading-thumb"></div>`
+        html`<div class="loading-thumb shimmer"></div>`
       }
-        <div class="badge-bottom">${clip.title}</div>
+        <div class="badge-bottom">${this.formatClipTitle(clip.title)}</div>
       </div>
     `;
   }
@@ -661,13 +879,20 @@ class FrigateNativeCard extends LitElement {
       <div class="player-full-row">
         <div class="player-wrapper">
           <div class="player-info">
-            <span>${this._selectedClip.title}</span>
-            <button class="close-btn" @click=${this.closeClip} aria-label="Close video">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="18" y1="6" x2="6" y2="18"></line>
-                <line x1="6" y1="6" x2="18" y2="18"></line>
-              </svg>              
-            </button>
+            <span>${this.formatClipTitle(this._selectedClip.title)}</span>
+            <div class="player-actions">
+              ${this._videoUrl ? html`
+                <a href="${this._videoUrl}" download="${this._selectedClip.title}.mp4" target="_blank" class="action-btn" aria-label="Download video">
+                  <ha-icon icon="mdi:download"></ha-icon>
+                </a>
+              ` : ''}
+              <button class="action-btn" @click=${this.closeClip} aria-label="Close video">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>              
+              </button>
+            </div>
           </div>
           
           <div class="video-box">
@@ -859,12 +1084,14 @@ class FrigateNativeCard extends LitElement {
       }
       
       .player-wrapper { padding: 12px; }
-      .player-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; color: var(--gray100, #ddd); font-size: 14px; }
-      .close-btn { 
+      .player-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; color: var(--gray100, #ddd); font-size: 14px; gap: 8px; }
+      .player-actions { display: flex; gap: 10px; align-items: center; }
+      .action-btn { 
         background: rgb(51, 51, 51); color: rgb(255, 255, 255); border: none; border-radius: 50%;
         cursor: pointer; width: 40px; height: 40px; padding: 0; display: flex; justify-content: center; align-items: center;
+        text-decoration: none;
       }
-      .close-btn:hover { opacity: 0.8; }
+      .action-btn:hover { opacity: 0.8; }
       
       .video-box { position: relative; width: 100%; aspect-ratio: 16/9; background: #000; display: flex; justify-content: center; align-items: center; border-radius: 12px; overflow: hidden; }
       video { width: 100%; height: 100%; display: block; }
@@ -876,7 +1103,17 @@ class FrigateNativeCard extends LitElement {
       .dl-btn:hover { background: #444; }
 
       .loading-text, .empty-state { grid-column: 1/-1; text-align: center; padding: 20px; color: var(--secondary-text-color); }
-      .loading-thumb { width: 100%; height: 100%; background: #333; opacity: 0.1; }
+      
+      .loading-thumb { width: 100%; height: 100%; background: #2a2a2a; }
+      .shimmer {
+        background: linear-gradient(-45deg, #2a2a2a 40%, #3a3a3a 50%, #2a2a2a 60%);
+        background-size: 300%;
+        background-position-x: 100%;
+        animation: shimmer 1.5s infinite linear;
+      }
+      @keyframes shimmer {
+        to { background-position-x: 0%; }
+      }
 
       .load-more-container {
         display: flex;
@@ -912,4 +1149,4 @@ class FrigateNativeCard extends LitElement {
 }
 customElements.define('mysmart-frigate-gallery', FrigateNativeCard);
 window.customCards = window.customCards || [];
-window.customCards.push({ type: "mysmart-frigate-gallery", name: "MySmart Frigate Gallery", description: "Clips Gallery for your Frigate cameras" });
+window.customCards.push({ type: "mysmart-frigate-gallery", name: "MySmart Frigate Gallery", description: "Clips gallery for your Frigate cameras" });

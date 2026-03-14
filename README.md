@@ -36,11 +36,9 @@ Subscribe to Youtube channel: https://www.youtube.com/@My_Smart_Home
 ### Main Options
 | Name | Type | Required? | Description | Default |
 | :--- | :--- | :--- | :--- | :--- |
-| `type` | string | **Required** | `custom:mysmart-frigate-events-card` | |
+| `type` | string | **Required** | `custom:mysmart-frigate-gallery` | |
 | `entities` | list | **Required** | A list of camera entities to display events for. Alternatively, a single `entity` can be provided. | |
 | `title` | string | Optional | The title of the card. | `'Security Feed'` |
-| `limit` | number | Optional | The total limit of events. | `50` |
-| `columns` | number | Optional | The number of columns for the grid. | `3` |
 | `virtualScrolling` | boolean | Optional | Enable virtual scrolling for performance. | `true` |
 | `card_height` | string | Optional | Height of the card (e.g., `500px` or `80vh`). | `''` |
 | `clipsPerLoad` | number | Optional | Number of clips to load at a time per camera. | `10` |
