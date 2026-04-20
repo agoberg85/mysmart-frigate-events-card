@@ -1,7 +1,7 @@
 {
   "name": "mysmart-frigate-events-card",
-  "version": "1.1.0",
-  "main": "rollup.config.js",
+  "version": "1.2.0",
+  "main": "mysmart-frigate-events-card.js",
   "scripts": {
     "build": "rollup -c",
     "test": "echo \"Error: no test specified\" && exit 1"

@@ -1,6 +1,11 @@
 import { LitElement, html, css } from 'lit';
 import Hls from 'hls.js';
 
+const DATE_REGEX = /(\d{4}-\d{2}-\d{2}[\s_T]\d{2}:\d{2}:\d{2})/;
+const LABEL_CLEANUP_REGEX = /[-_\[\]]/g;
+const KNOWN_LABELS = ['person', 'car', 'dog', 'cat', 'crying', 'package', 'vehicle', 'bicycle', 'bird'];
+const INITIAL_EAGER_THUMBNAILS = 6;
+
 class FrigateNativeCard extends LitElement {
   static get properties() {
     return {
@@ -47,6 +52,8 @@ class FrigateNativeCard extends LitElement {
     this._scrollLoadHandler = null;
     this._scrollLoadFrame = null;
     this._observedScroller = null;
+    this._clipIndex = new Map();
+    this._availableLabels = [];
   }
 
   setConfig(config) {
@@ -62,7 +69,15 @@ class FrigateNativeCard extends LitElement {
     };
     this._thumbnails = {};
     this._allClips = [];
+    this._clipIndex = new Map();
+    this._availableLabels = [];
     const cams = this.getTargetCameras();
+    if (this.config.limit != null && config.clipsPerLoad == null) {
+      const limitValue = Number(this.config.limit);
+      if (Number.isFinite(limitValue) && limitValue > 0) {
+        this.config.clipsPerLoad = Math.max(1, Math.ceil(limitValue / Math.max(cams.length, 1)));
+      }
+    }
     this._activeCameras = new Set(cams);
 
     // Initialize clips loaded count
@@ -86,16 +101,108 @@ class FrigateNativeCard extends LitElement {
   extractLabels(clips) {
     const labels = new Set();
     clips.forEach(clip => {
-      const title = clip.title.toLowerCase();
-      // Common Frigate labels - extend this list as needed
-      const knownLabels = ['person', 'car', 'dog', 'cat', 'crying', 'package', 'vehicle', 'bicycle', 'bird'];
-      knownLabels.forEach(label => {
-        if (title.includes(label)) {
-          labels.add(label);
-        }
-      });
+      (clip._labels || []).forEach(label => labels.add(label));
     });
     return Array.from(labels).sort();
+  }
+
+  parseClipMetadata(rawTitle) {
+    const title = rawTitle || '';
+    const normalizedTitle = title.toLowerCase();
+    const labels = KNOWN_LABELS.filter(label => normalizedTitle.includes(label));
+    const match = title.match(DATE_REGEX);
+
+    if (!match) {
+      return {
+        _normalizedTitle: normalizedTitle,
+        _labels: labels,
+        _formattedTitle: title,
+        _clipDayTs: null
+      };
+    }
+
+    try {
+      const clipDate = new Date(match[1].replace(/[_T]/, ' '));
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+
+      const clipDay = new Date(clipDate);
+      clipDay.setHours(0, 0, 0, 0);
+
+      let dayStr = '';
+      if (clipDay.getTime() === today.getTime()) {
+        dayStr = 'Today';
+      } else if (clipDay.getTime() === yesterday.getTime()) {
+        dayStr = 'Yesterday';
+      } else {
+        dayStr = clipDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      }
+
+      const timeStr = clipDate.toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+      });
+
+      const cleanLabel = title
+        .replace(DATE_REGEX, '')
+        .replace(LABEL_CLEANUP_REGEX, ' ')
+        .trim()
+        .replace(/\s+/g, ' ');
+
+      return {
+        _normalizedTitle: normalizedTitle,
+        _labels: labels,
+        _formattedTitle: `${dayStr} ${timeStr}${cleanLabel ? ' - ' + cleanLabel : ''}`,
+        _clipDayTs: clipDay.getTime()
+      };
+    } catch (e) {
+      return {
+        _normalizedTitle: normalizedTitle,
+        _labels: labels,
+        _formattedTitle: title,
+        _clipDayTs: null
+      };
+    }
+  }
+
+  normalizeClip(clip, cameraName) {
+    return {
+      ...clip,
+      _camera: cameraName,
+      _thumbnailUrl: this.getAuthenticatedUrl(clip.thumbnail),
+      ...this.parseClipMetadata(clip.title)
+    };
+  }
+
+  getAuthenticatedUrl(url) {
+    if (!url || !this.hass?.auth?.data?.access_token) {
+      return url;
+    }
+
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}authSig=${this.hass.auth.data.access_token}`;
+  }
+
+  syncClipState(allClips, { cleanup = false } = {}) {
+    if (cleanup) {
+      this.cleanupUnusedThumbnails(allClips);
+    }
+
+    this._allClips = allClips;
+    this._clipIndex = new Map(allClips.map(clip => [clip.media_content_id, clip]));
+
+    const availableLabels = this.extractLabels(allClips);
+    this._availableLabels = availableLabels;
+    if (this._activeLabels.size === 0 && availableLabels.length > 0) {
+      this._activeLabels = new Set(availableLabels);
+    }
+
+    this.updateDisplayedClips();
+
   }
 
   async fetchMedia() {
@@ -128,33 +235,50 @@ class FrigateNativeCard extends LitElement {
         potentialCameraFolders = eventsContent.children || [];
       }
 
-      for (const folder of potentialCameraFolders) {
-        const cleanTitle = folder.title.toLowerCase().replace(/\s*\(\d+\)$/, "");
-        if (targetCams.includes(cleanTitle)) {
-          const cameraClips = [];
+      const cameraFolders = potentialCameraFolders
+        .map(folder => ({
+          folder,
+          cleanTitle: folder.title.toLowerCase().replace(/\s*\(\d+\)$/, "")
+        }))
+        .filter(({ cleanTitle }) => targetCams.includes(cleanTitle));
+
+      const clipsByCamera = new Map();
+      const updatePartialState = () => {
+        const partialClips = Array.from(clipsByCamera.values())
+          .flat()
+          .sort((a, b) => b.title.localeCompare(a.title));
+        this.syncClipState(partialClips);
+      };
+
+      await Promise.all(
+        cameraFolders.map(async ({ folder, cleanTitle }) => {
           const limit = this._loadedClipsPerCamera[cleanTitle] || this.config.clipsPerLoad;
-          await this.fetchClipsFromCameraFolder(folder, cameraClips, limit);
+          const clips = await this.fetchClipsFromCameraFolder(folder, limit, partialClips => {
+            if (requestToken !== this._mediaRequestToken) return;
+
+            clipsByCamera.set(
+              cleanTitle,
+              partialClips.map(clip => this.normalizeClip(clip, cleanTitle))
+            );
+
+            updatePartialState();
+          });
           if (requestToken !== this._mediaRequestToken) return;
-          cameraClips.forEach(c => c._camera = cleanTitle);
-          allClips = allClips.concat(cameraClips);
-        }
-      }
+
+          clipsByCamera.set(
+            cleanTitle,
+            clips.map(clip => this.normalizeClip(clip, cleanTitle))
+          );
+
+          updatePartialState();
+        })
+      );
 
       if (requestToken !== this._mediaRequestToken) return;
-      this.cleanupUnusedThumbnails(allClips);
-      this._allClips = allClips;
-
-      // Extract and set available labels
-      const availableLabels = this.extractLabels(allClips);
-      if (this._activeLabels.size === 0 && availableLabels.length > 0) {
-        this._activeLabels = new Set(availableLabels);
-      }
-
-      this.updateDisplayedClips();
-
-      if (!this.config.virtualScrolling) {
-        this.loadThumbnailsBatch();
-      }
+      allClips = Array.from(clipsByCamera.values())
+        .flat()
+        .sort((a, b) => b.title.localeCompare(a.title));
+      this.syncClipState(allClips, { cleanup: true });
 
     } catch (e) {
       if (requestToken === this._mediaRequestToken && e.name !== 'AbortError') {
@@ -193,30 +317,21 @@ class FrigateNativeCard extends LitElement {
     const filtered = this._allClips.filter(clip => {
       if (!clip._camera || !this._activeCameras.has(clip._camera)) return false;
 
-      // Label filtering
       if (this._activeLabels.size > 0) {
-        const title = clip.title.toLowerCase();
-        const hasActiveLabel = Array.from(this._activeLabels).some(label =>
-          title.includes(label.toLowerCase())
-        );
+        const hasActiveLabel = clip._labels?.some(label => this._activeLabels.has(label));
         if (!hasActiveLabel) return false;
       }
-      
-      // Date filtering
+
       if (this._dateFilter !== 'all') {
-        const dateRegex = /(\d{4}-\d{2}-\d{2}[\s_T]\d{2}:\d{2}:\d{2})/;
-        const match = clip.title.match(dateRegex);
-        if (match) {
-          const clipDate = new Date(match[1].replace(/[_T]/, ' '));
-          const now = new Date();
-          const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-          const clipDay = new Date(clipDate.getFullYear(), clipDate.getMonth(), clipDate.getDate());
-          const diffDays = Math.round((today - clipDay) / (1000 * 60 * 60 * 24));
-          
-          if (this._dateFilter === 'today' && diffDays !== 0) return false;
-          if (this._dateFilter === 'yesterday' && diffDays !== 1) return false;
-          if (this._dateFilter === 'past_week' && diffDays > 7) return false;
-        }
+        if (clip._clipDayTs === null) return false;
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const diffDays = Math.round((today.getTime() - clip._clipDayTs) / (1000 * 60 * 60 * 24));
+
+        if (this._dateFilter === 'today' && diffDays !== 0) return false;
+        if (this._dateFilter === 'yesterday' && diffDays !== 1) return false;
+        if (this._dateFilter === 'past_week' && diffDays > 7) return false;
       }
 
       return true;
@@ -226,9 +341,19 @@ class FrigateNativeCard extends LitElement {
     this._clips = filtered;
   }
 
-  async fetchClipsFromCameraFolder(folder, collection, limit = Infinity) {
+  async fetchClipsFromCameraFolder(folder, limit = Infinity, onProgress = null) {
     const content = await this.hass.callWS({ type: 'media_source/browse_media', media_content_id: folder.media_content_id });
-    if (!content.children || content.children.length === 0) return;
+    if (!content.children || content.children.length === 0) return [];
+
+    const collection = [];
+    let reportedCount = 0;
+    const emitProgress = () => {
+      if (!onProgress || collection.length === reportedCount) {
+        return;
+      }
+      reportedCount = collection.length;
+      onProgress([...collection]);
+    };
 
     const isDateStructure = content.children[0].can_expand;
 
@@ -243,6 +368,7 @@ class FrigateNativeCard extends LitElement {
             if (collection.length >= limit) break;
             if (!c.can_expand) collection.push(c);
           }
+          emitProgress();
         }
       }
     } else {
@@ -251,26 +377,29 @@ class FrigateNativeCard extends LitElement {
         if (collection.length >= limit) break;
         if (!c.can_expand) collection.push(c);
       }
+      emitProgress();
     }
+
+    return collection;
   }
 
-  async loadThumbnailsBatch() {
-    if (!this._clips) return;
-    const clipsToLoad = this._clips.filter(clip =>
-      !this._thumbnails[clip.media_content_id] &&
-      !this._thumbnailLoadQueue.has(clip.media_content_id)
-    );
-    const concurrencyLimit = 5;
-    for (let i = 0; i < clipsToLoad.length; i += concurrencyLimit) {
-      const batch = clipsToLoad.slice(i, i + concurrencyLimit);
-      await Promise.all(batch.map(clip => this.loadSingleThumbnail(clip)));
+  markThumbnailLoaded(clipId) {
+    const currentValue = this._thumbnails[clipId];
+    if (currentValue === 'native' || (typeof currentValue === 'string' && currentValue.startsWith('blob:'))) {
+      return;
     }
+
+    this._thumbnails = {
+      ...this._thumbnails,
+      [clipId]: 'native'
+    };
   }
 
-  async loadSingleThumbnail(clip) {
+  async loadThumbnailFallback(clip) {
     const id = clip.media_content_id;
-
-    if (this._thumbnails[id] || this._thumbnailLoadQueue.has(id)) return;
+    if (this._thumbnailLoadQueue.has(id)) {
+      return;
+    }
 
     this._thumbnailLoadQueue.add(id);
 
@@ -279,29 +408,63 @@ class FrigateNativeCard extends LitElement {
       const timeout = setTimeout(() => controller.abort(), 10000);
 
       const res = await window.fetch(clip.thumbnail, {
-        headers: { 'Authorization': `Bearer ${this.hass?.auth?.data?.access_token || ''}` },
+        headers: { Authorization: `Bearer ${this.hass?.auth?.data?.access_token || ''}` },
         signal: controller.signal
       });
 
       clearTimeout(timeout);
 
-      if (res.ok) {
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        this._thumbnailUrls.set(id, url);
-
-        this._thumbnails[id] = url;
-        this.requestUpdate('_thumbnails');
-      } else {
-        console.warn(`[FrigateCard] Thumbnail failed for ${clip.title}: ${res.status}`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
       }
+
+      const blob = await res.blob();
+      const existingUrl = this._thumbnailUrls.get(id);
+      if (existingUrl) {
+        URL.revokeObjectURL(existingUrl);
+      }
+
+      const objectUrl = URL.createObjectURL(blob);
+      this._thumbnailUrls.set(id, objectUrl);
+      this._thumbnails = {
+        ...this._thumbnails,
+        [id]: objectUrl
+      };
     } catch (e) {
       if (e.name !== 'AbortError') {
-        console.warn(`[FrigateCard] Thumbnail error for ${clip.title}:`, e.message);
+        this._thumbnails = {
+          ...this._thumbnails,
+          [id]: 'error'
+        };
       }
     } finally {
       this._thumbnailLoadQueue.delete(id);
     }
+  }
+
+  handleThumbnailError(clip) {
+    const currentValue = this._thumbnails[clip.media_content_id];
+    if (currentValue === 'error') {
+      return;
+    }
+
+    if (typeof currentValue === 'string' && currentValue.startsWith('blob:')) {
+      this._thumbnails = {
+        ...this._thumbnails,
+        [clip.media_content_id]: 'error'
+      };
+      return;
+    }
+
+    this.loadThumbnailFallback(clip);
+  }
+
+  shouldRenderThumbnailImage(clipId, index) {
+    return index < INITIAL_EAGER_THUMBNAILS || this._visibleClips.has(clipId) || !this.config.virtualScrolling;
+  }
+
+  shouldUpdate(changedProps) {
+    return !(changedProps.size === 1 && changedProps.has('hass') && !!this._clips);
   }
 
   async updated(changedProps) {
@@ -322,6 +485,14 @@ class FrigateNativeCard extends LitElement {
   }
 
   setupResizeObserver() {
+    if (this.config.columns) {
+      const columns = Number(this.config.columns);
+      if (Number.isFinite(columns) && columns > 0 && this._currentColumns !== columns) {
+        this._currentColumns = columns;
+      }
+      return;
+    }
+
     if (!this._resizeObserver) {
       this._resizeObserver = new ResizeObserver(entries => {
         for (let entry of entries) {
@@ -345,40 +516,7 @@ class FrigateNativeCard extends LitElement {
   }
 
   formatClipTitle(rawTitle) {
-    const dateRegex = /(\d{4}-\d{2}-\d{2}[\s_T]\d{2}:\d{2}:\d{2})/;
-    const match = rawTitle.match(dateRegex);
-    if (!match) return rawTitle;
-
-    try {
-      const dateStr = match[1].replace(/[_T]/, ' ');
-      const clipDate = new Date(dateStr);
-      
-      const now = new Date();
-      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const yesterday = new Date(today);
-      yesterday.setDate(yesterday.getDate() - 1);
-      const clipDay = new Date(clipDate.getFullYear(), clipDate.getMonth(), clipDate.getDate());
-      
-      let dayStr = "";
-      if (clipDay.getTime() === today.getTime()) {
-        dayStr = "Today";
-      } else if (clipDay.getTime() === yesterday.getTime()) {
-        dayStr = "Yesterday";
-      } else {
-        dayStr = clipDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-      }
-
-      const timeStr = clipDate.toLocaleTimeString(undefined, { 
-        hour: '2-digit', minute: '2-digit', hour12: false 
-      });
-      
-      const labelsRegex = /[-_\[\]]/g;
-      const cleanLabel = rawTitle.replace(dateRegex, '').replace(labelsRegex, ' ').trim().replace(/\s+/g, ' ');
-
-      return `${dayStr} ${timeStr}${cleanLabel ? ' - ' + cleanLabel : ''}`;
-    } catch(e) {
-      return rawTitle;
-    }
+    return this.parseClipMetadata(rawTitle)._formattedTitle;
   }
 
   scrollPlayerIntoView() {
@@ -409,10 +547,6 @@ class FrigateNativeCard extends LitElement {
               this._visibleClips.add(clipId);
               needsUpdate = true;
             }
-            const clip = this._clips?.find(c => c.media_content_id === clipId);
-            if (clip && !this._thumbnails[clipId] && !this._thumbnailLoadQueue.has(clipId)) {
-              this.loadSingleThumbnail(clip);
-            }
           } else {
             if (this._visibleClips.has(clipId)) {
               this._visibleClips.delete(clipId);
@@ -431,7 +565,6 @@ class FrigateNativeCard extends LitElement {
       this.shadowRoot.querySelectorAll('.thumbnail').forEach(el => {
         this._intersectionObserver.observe(el);
       });
-      this.loadVisibleThumbnails();
     });
   }
 
@@ -458,45 +591,10 @@ class FrigateNativeCard extends LitElement {
 
       this._scrollLoadFrame = window.requestAnimationFrame(() => {
         this._scrollLoadFrame = null;
-        this.loadVisibleThumbnails();
       });
     };
 
     scroller.addEventListener('scroll', this._scrollLoadHandler, { passive: true });
-    this.loadVisibleThumbnails();
-  }
-
-  loadVisibleThumbnails() {
-    if (!this._clips?.length) {
-      return;
-    }
-
-    const scroller = this.shadowRoot?.querySelector('.scroller');
-    const rootRect = this.config.card_height && scroller
-      ? scroller.getBoundingClientRect()
-      : { top: 0, bottom: window.innerHeight };
-    const preloadOffset = 250;
-
-    this.shadowRoot.querySelectorAll('.thumbnail').forEach(el => {
-      const clipId = el.dataset.clipId;
-      if (!clipId || this._thumbnails[clipId] || this._thumbnailLoadQueue.has(clipId)) {
-        return;
-      }
-
-      const rect = el.getBoundingClientRect();
-      const isNearViewport =
-        rect.bottom >= rootRect.top - preloadOffset &&
-        rect.top <= rootRect.bottom + preloadOffset;
-
-      if (!isNearViewport) {
-        return;
-      }
-
-      const clip = this._clips.find(item => item.media_content_id === clipId);
-      if (clip) {
-        this.loadSingleThumbnail(clip);
-      }
-    });
   }
 
   initPlayer() {
@@ -721,7 +819,7 @@ class FrigateNativeCard extends LitElement {
     const cams = this.getTargetCameras();
     const columns = this._currentColumns;
     const cardHeight = this.config.card_height;
-    const availableLabels = this.extractLabels(this._allClips || []);
+    const availableLabels = this._availableLabels;
 
     const itemsToRender = [];
     let selectedIndex = -1;
@@ -739,7 +837,7 @@ class FrigateNativeCard extends LitElement {
     let playerRendered = false;
 
     visibleClips.forEach((clip, index) => {
-      itemsToRender.push(this.renderThumbnail(clip));
+      itemsToRender.push(this.renderThumbnail(clip, index));
       if (index === insertionIndex - 1) {
         itemsToRender.push(this.renderPlayer());
         playerRendered = true;
@@ -855,8 +953,12 @@ class FrigateNativeCard extends LitElement {
     `;
   }
 
-  renderThumbnail(clip) {
-    const thumbUrl = this._thumbnails[clip.media_content_id];
+  renderThumbnail(clip, index) {
+    const thumbState = this._thumbnails[clip.media_content_id];
+    const hasFallbackUrl = typeof thumbState === 'string' && thumbState.startsWith('blob:');
+    const imageSrc = hasFallbackUrl ? thumbState : (clip._thumbnailUrl || clip.thumbnail);
+    const isLoaded = thumbState === 'native' || hasFallbackUrl;
+    const shouldRenderImage = this.shouldRenderThumbnailImage(clip.media_content_id, index);
     const isSelected = this._selectedClip && this._selectedClip.media_content_id === clip.media_content_id;
     return html`
       <div 
@@ -864,11 +966,20 @@ class FrigateNativeCard extends LitElement {
         data-clip-id="${clip.media_content_id}"
         @click=${() => this.openClip(clip)}
       >
-        ${thumbUrl ?
-        html`<img src="${thumbUrl}" loading="lazy" alt="${clip.title}" />` :
-        html`<div class="loading-thumb shimmer"></div>`
-      }
-        <div class="badge-bottom">${this.formatClipTitle(clip.title)}</div>
+        ${shouldRenderImage ? html`
+          ${!isLoaded ? html`<div class="loading-thumb shimmer"></div>` : ''}
+          <img
+            class="thumb-img ${isLoaded ? 'loaded' : 'pending'}"
+            src="${imageSrc}"
+            loading="${index < INITIAL_EAGER_THUMBNAILS ? 'eager' : 'lazy'}"
+            fetchpriority="${index < INITIAL_EAGER_THUMBNAILS ? 'high' : 'low'}"
+            decoding="async"
+            alt="${clip.title}"
+            @load=${() => this.markThumbnailLoaded(clip.media_content_id)}
+            @error=${() => this.handleThumbnailError(clip)}
+          />
+        ` : html`<div class="loading-thumb shimmer"></div>`}
+        <div class="badge-bottom">${clip._formattedTitle || this.formatClipTitle(clip.title)}</div>
       </div>
     `;
   }
@@ -879,7 +990,7 @@ class FrigateNativeCard extends LitElement {
       <div class="player-full-row">
         <div class="player-wrapper">
           <div class="player-info">
-            <span>${this.formatClipTitle(this._selectedClip.title)}</span>
+            <span>${this._selectedClip._formattedTitle || this.formatClipTitle(this._selectedClip.title)}</span>
             <div class="player-actions">
               ${this._videoUrl ? html`
                 <a href="${this._videoUrl}" download="${this._selectedClip.title}.mp4" target="_blank" class="action-btn" aria-label="Download video">
@@ -1067,6 +1178,9 @@ class FrigateNativeCard extends LitElement {
       }
       .thumbnail.selected { border-color: rgb(242, 133, 201); opacity: 0.7; }
       .thumbnail img { width: 100%; height: 100%; object-fit: cover; animation: fade-in 0.3s; }
+      .thumb-img { position: absolute; inset: 0; }
+      .thumb-img.pending { opacity: 0; }
+      .thumb-img.loaded { opacity: 1; }
       .badge-bottom { 
         position: absolute; bottom: 0; left: 0; width: 100%; background: rgba(0,0,0,0.7); color: white; 
         font-size: 10px; padding: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; 

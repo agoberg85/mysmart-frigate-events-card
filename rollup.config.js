@@ -6,7 +6,7 @@ export default {
     output: {
         file: 'mysmart-frigate-events-card.js',
         format: 'es',
-        sourcemap: true,
+        sourcemap: false,
     },
     plugins: [
         nodeResolve(),
