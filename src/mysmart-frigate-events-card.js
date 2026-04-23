@@ -1,4 +1,5 @@
 import { LitElement, html, css } from 'lit';
+import { repeat } from 'lit/directives/repeat.js';
 import Hls from 'hls.js';
 
 const DATE_REGEX = /(\d{4}-\d{2}-\d{2}[\s_T]\d{2}:\d{2}:\d{2})/;
@@ -27,7 +28,8 @@ class FrigateNativeCard extends LitElement {
       _loadedClipsPerCamera: { state: true },
       _dateFilter: { state: true },
       _showDateMenu: { state: true },
-      _currentColumns: { state: true }
+      _currentColumns: { state: true },
+      _videoAspectRatio: { state: true }
     };
   }
 
@@ -36,7 +38,10 @@ class FrigateNativeCard extends LitElement {
     this._thumbnailUrls = new Map();
     this._intersectionObserver = null;
     this._videoErrorHandler = null;
+    this._videoMetadataHandler = null;
     this._cameraToggleTimeout = null;
+    this._thumbnailRetryTimers = new Map();
+    this._thumbnailRetryCounts = new Map();
     this._visibleClips = new Set();
     this._allClips = [];
     this._thumbnailLoadQueue = new Set();
@@ -54,6 +59,9 @@ class FrigateNativeCard extends LitElement {
     this._observedScroller = null;
     this._clipIndex = new Map();
     this._availableLabels = [];
+    this._hasUserModifiedLabels = false;
+    this._cameraAspectRatios = new Map();
+    this._videoAspectRatio = null;
   }
 
   setConfig(config) {
@@ -65,12 +73,17 @@ class FrigateNativeCard extends LitElement {
       virtualScrolling: true,
       card_height: '',
       clipsPerLoad: 10,
+      use12HourTime: false,
       ...config
     };
     this._thumbnails = {};
     this._allClips = [];
     this._clipIndex = new Map();
     this._availableLabels = [];
+    this._thumbnailRetryCounts.clear();
+    this._thumbnailRetryTimers.forEach(timer => clearTimeout(timer));
+    this._thumbnailRetryTimers.clear();
+    this._hasUserModifiedLabels = false;
     const cams = this.getTargetCameras();
     if (this.config.limit != null && config.clipsPerLoad == null) {
       const limitValue = Number(this.config.limit);
@@ -144,7 +157,7 @@ class FrigateNativeCard extends LitElement {
       const timeStr = clipDate.toLocaleTimeString(undefined, {
         hour: '2-digit',
         minute: '2-digit',
-        hour12: false
+        hour12: this.config.use12HourTime
       });
 
       const cleanLabel = title
@@ -197,8 +210,12 @@ class FrigateNativeCard extends LitElement {
 
     const availableLabels = this.extractLabels(allClips);
     this._availableLabels = availableLabels;
-    if (this._activeLabels.size === 0 && availableLabels.length > 0) {
+    if (!this._hasUserModifiedLabels) {
       this._activeLabels = new Set(availableLabels);
+    } else if (availableLabels.length > 0) {
+      this._activeLabels = new Set(
+        [...this._activeLabels].filter(label => availableLabels.includes(label))
+      );
     }
 
     this.updateDisplayedClips();
@@ -346,12 +363,12 @@ class FrigateNativeCard extends LitElement {
     if (!content.children || content.children.length === 0) return [];
 
     const collection = [];
-    let reportedCount = 0;
+    let hasReportedInitialProgress = false;
     const emitProgress = () => {
-      if (!onProgress || collection.length === reportedCount) {
+      if (!onProgress || hasReportedInitialProgress || collection.length === 0) {
         return;
       }
-      reportedCount = collection.length;
+      hasReportedInitialProgress = true;
       onProgress([...collection]);
     };
 
@@ -384,6 +401,7 @@ class FrigateNativeCard extends LitElement {
   }
 
   markThumbnailLoaded(clipId) {
+    this.clearThumbnailRetry(clipId);
     const currentValue = this._thumbnails[clipId];
     if (currentValue === 'native' || (typeof currentValue === 'string' && currentValue.startsWith('blob:'))) {
       return;
@@ -407,8 +425,9 @@ class FrigateNativeCard extends LitElement {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
 
-      const res = await window.fetch(clip.thumbnail, {
+      const res = await window.fetch(this.getAuthenticatedUrl(clip.thumbnail), {
         headers: { Authorization: `Bearer ${this.hass?.auth?.data?.access_token || ''}` },
+        cache: 'force-cache',
         signal: controller.signal
       });
 
@@ -426,16 +445,14 @@ class FrigateNativeCard extends LitElement {
 
       const objectUrl = URL.createObjectURL(blob);
       this._thumbnailUrls.set(id, objectUrl);
+      this.clearThumbnailRetry(id);
       this._thumbnails = {
         ...this._thumbnails,
         [id]: objectUrl
       };
     } catch (e) {
       if (e.name !== 'AbortError') {
-        this._thumbnails = {
-          ...this._thumbnails,
-          [id]: 'error'
-        };
+        this.scheduleThumbnailRetry(id);
       }
     } finally {
       this._thumbnailLoadQueue.delete(id);
@@ -443,20 +460,58 @@ class FrigateNativeCard extends LitElement {
   }
 
   handleThumbnailError(clip) {
-    const currentValue = this._thumbnails[clip.media_content_id];
-    if (currentValue === 'error') {
+    const clipId = clip.media_content_id;
+    const currentValue = this._thumbnails[clipId];
+    if (this._thumbnailLoadQueue.has(clipId)) {
       return;
     }
 
     if (typeof currentValue === 'string' && currentValue.startsWith('blob:')) {
+      URL.revokeObjectURL(currentValue);
+      this._thumbnailUrls.delete(clipId);
+      const nextThumbnails = { ...this._thumbnails };
+      delete nextThumbnails[clipId];
+      this._thumbnails = nextThumbnails;
+    }
+
+    this.loadThumbnailFallback(clip);
+  }
+
+  clearThumbnailRetry(clipId) {
+    const retryTimer = this._thumbnailRetryTimers.get(clipId);
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      this._thumbnailRetryTimers.delete(clipId);
+    }
+    this._thumbnailRetryCounts.delete(clipId);
+  }
+
+  scheduleThumbnailRetry(clipId) {
+    const attempts = (this._thumbnailRetryCounts.get(clipId) || 0) + 1;
+    this._thumbnailRetryCounts.set(clipId, attempts);
+
+    if (attempts >= 3) {
       this._thumbnails = {
         ...this._thumbnails,
-        [clip.media_content_id]: 'error'
+        [clipId]: 'error'
       };
       return;
     }
 
-    this.loadThumbnailFallback(clip);
+    if (this._thumbnailRetryTimers.has(clipId)) {
+      return;
+    }
+
+    const retryDelayMs = 750 * attempts;
+    const retryTimer = window.setTimeout(() => {
+      this._thumbnailRetryTimers.delete(clipId);
+      const clip = this._clipIndex.get(clipId);
+      if (clip) {
+        this.loadThumbnailFallback(clip);
+      }
+    }, retryDelayMs);
+
+    this._thumbnailRetryTimers.set(clipId, retryTimer);
   }
 
   shouldRenderThumbnailImage(clipId, index) {
@@ -608,6 +663,10 @@ class FrigateNativeCard extends LitElement {
     if (this._videoErrorHandler) {
       videoEl.removeEventListener('error', this._videoErrorHandler);
     }
+    if (this._videoMetadataHandler) {
+      videoEl.removeEventListener('loadedmetadata', this._videoMetadataHandler);
+      this._videoMetadataHandler = null;
+    }
 
     videoEl.removeAttribute('src');
     videoEl.load();
@@ -618,6 +677,18 @@ class FrigateNativeCard extends LitElement {
       }
     };
     videoEl.addEventListener('error', this._videoErrorHandler);
+    this._videoMetadataHandler = () => {
+      if (!videoEl.videoWidth || !videoEl.videoHeight) {
+        return;
+      }
+
+      const aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
+      this._videoAspectRatio = aspectRatio;
+      if (this._selectedClip?._camera) {
+        this._cameraAspectRatios.set(this._selectedClip._camera, aspectRatio);
+      }
+    };
+    videoEl.addEventListener('loadedmetadata', this._videoMetadataHandler);
 
     let authUrl = this._videoUrl;
     if (this._videoUrl && this.hass?.auth?.data?.access_token) {
@@ -656,6 +727,7 @@ class FrigateNativeCard extends LitElement {
     }
     const requestToken = ++this._clipRequestToken;
     this._selectedClip = clip;
+    this._videoAspectRatio = this._cameraAspectRatios.get(clip._camera) || null;
     this._videoUrl = null;
     this._videoError = null;
     try {
@@ -678,6 +750,10 @@ class FrigateNativeCard extends LitElement {
     this._clipRequestToken += 1;
     const videoEl = this.shadowRoot.querySelector('video');
     if (videoEl) {
+      if (this._videoMetadataHandler) {
+        videoEl.removeEventListener('loadedmetadata', this._videoMetadataHandler);
+        this._videoMetadataHandler = null;
+      }
       if (this._videoErrorHandler) {
         videoEl.removeEventListener('error', this._videoErrorHandler);
         this._videoErrorHandler = null;
@@ -693,6 +769,7 @@ class FrigateNativeCard extends LitElement {
     }
 
     this._selectedClip = null;
+    this._videoAspectRatio = null;
     this._videoUrl = null;
     this._videoError = null;
   }
@@ -714,6 +791,7 @@ class FrigateNativeCard extends LitElement {
   }
 
   toggleLabel(label) {
+    this._hasUserModifiedLabels = true;
     if (this._activeLabels.has(label)) {
       this._activeLabels.delete(label);
     } else {
@@ -775,6 +853,9 @@ class FrigateNativeCard extends LitElement {
 
     this._thumbnailUrls.forEach(url => URL.revokeObjectURL(url));
     this._thumbnailUrls.clear();
+    this._thumbnailRetryTimers.forEach(timer => clearTimeout(timer));
+    this._thumbnailRetryTimers.clear();
+    this._thumbnailRetryCounts.clear();
 
     if (this._hls) {
       this._hls.destroy();
@@ -807,6 +888,9 @@ class FrigateNativeCard extends LitElement {
     }
 
     const videoEl = this.shadowRoot?.querySelector('video');
+    if (videoEl && this._videoMetadataHandler) {
+      videoEl.removeEventListener('loadedmetadata', this._videoMetadataHandler);
+    }
     if (videoEl && this._videoErrorHandler) {
       videoEl.removeEventListener('error', this._videoErrorHandler);
     }
@@ -837,15 +921,24 @@ class FrigateNativeCard extends LitElement {
     let playerRendered = false;
 
     visibleClips.forEach((clip, index) => {
-      itemsToRender.push(this.renderThumbnail(clip, index));
+      itemsToRender.push({
+        key: `clip-${clip.media_content_id}`,
+        template: this.renderThumbnail(clip, index)
+      });
       if (index === insertionIndex - 1) {
-        itemsToRender.push(this.renderPlayer());
+        itemsToRender.push({
+          key: `player-${this._selectedClip?.media_content_id || 'none'}`,
+          template: this.renderPlayer()
+        });
         playerRendered = true;
       }
     });
 
     if (selectedIndex !== -1 && !playerRendered) {
-      itemsToRender.push(this.renderPlayer());
+      itemsToRender.push({
+        key: `player-${this._selectedClip?.media_content_id || 'none'}`,
+        template: this.renderPlayer()
+      });
     }
 
     const scrollerStyle = cardHeight ? `height: ${cardHeight}; overflow-y: auto;` : '';
@@ -938,7 +1031,7 @@ class FrigateNativeCard extends LitElement {
           <div class="grid-container" style="--column-count: ${columns}">
             ${!this._clips ? html`<div class="loading-text">Loading...</div>` : ''}
             ${this._clips && visibleClips.length === 0 ? html`<div class="empty-state">No clips found.</div>` : ''}
-            ${itemsToRender}
+            ${repeat(itemsToRender, item => item.key, item => item.template)}
           </div>
 
           ${this._clips && visibleClips.length > 0 ? html`
@@ -986,6 +1079,7 @@ class FrigateNativeCard extends LitElement {
 
   renderPlayer() {
     if (!this._selectedClip) return html``;
+    const aspectRatio = this._videoAspectRatio || '16 / 9';
     return html`
       <div class="player-full-row">
         <div class="player-wrapper">
@@ -1006,7 +1100,7 @@ class FrigateNativeCard extends LitElement {
             </div>
           </div>
           
-          <div class="video-box">
+          <div class="video-box" style="aspect-ratio: ${aspectRatio};">
             ${this._videoUrl ? html`
               <video 
                 autoplay 

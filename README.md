@@ -42,3 +42,4 @@ Subscribe to Youtube channel: https://www.youtube.com/@My_Smart_Home
 | `virtualScrolling` | boolean | Optional | Enable virtual scrolling for performance. | `true` |
 | `card_height` | string | Optional | Height of the card (e.g., `500px` or `80vh`). | `''` |
 | `clipsPerLoad` | number | Optional | Number of clips to load at a time per camera. | `10` |
+| `use12HourTime` | boolean | Optional | Display clip timestamps in 12-hour format with AM/PM. | `false` |
