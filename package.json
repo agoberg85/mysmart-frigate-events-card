@@ -1,15 +1,29 @@
 {
   "name": "mysmart-frigate-events-card",
   "version": "1.3.0",
+  "description": "A Frigate events card for Home Assistant dashboards.",
   "main": "mysmart-frigate-events-card.js",
+  "type": "module",
+  "homepage": "https://github.com/agoberg85/mysmart-frigate-events-card",
+  "bugs": {
+    "url": "https://github.com/agoberg85/mysmart-frigate-events-card/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agoberg85/mysmart-frigate-events-card.git"
+  },
   "scripts": {
     "build": "rollup -c",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "home-assistant",
+    "lovelace",
+    "frigate",
+    "custom-card"
+  ],
+  "author": "agoberg85",
   "license": "ISC",
-  "description": "",
   "devDependencies": {
     "@rollup/plugin-node-resolve": "^16.0.3",
     "@rollup/plugin-terser": "^1.0.0",
